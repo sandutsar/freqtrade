@@ -4,8 +4,8 @@ from typing import Any, Dict
 from freqtrade import constants
 from freqtrade.configuration import setup_utils_configuration
 from freqtrade.enums import RunMode
-from freqtrade.exceptions import OperationalException
-from freqtrade.misc import round_coin_value
+from freqtrade.exceptions import ConfigurationError, OperationalException
+from freqtrade.util import fmt_coin
 
 
 logger = logging.getLogger(__name__)
@@ -25,12 +25,16 @@ def setup_optimize_configuration(args: Dict[str, Any], method: RunMode) -> Dict[
         RunMode.HYPEROPT: 'hyperoptimization',
     }
     if method in no_unlimited_runmodes.keys():
+        wallet_size = config['dry_run_wallet'] * config['tradable_balance_ratio']
+        # tradable_balance_ratio
         if (config['stake_amount'] != constants.UNLIMITED_STAKE_AMOUNT
-                and config['stake_amount'] > config['dry_run_wallet']):
-            wallet = round_coin_value(config['dry_run_wallet'], config['stake_currency'])
-            stake = round_coin_value(config['stake_amount'], config['stake_currency'])
-            raise OperationalException(f"Starting balance ({wallet}) "
-                                       f"is smaller than stake_amount {stake}.")
+                and config['stake_amount'] > wallet_size):
+            wallet = fmt_coin(wallet_size, config['stake_currency'])
+            stake = fmt_coin(config['stake_amount'], config['stake_currency'])
+            raise ConfigurationError(
+                f"Starting balance ({wallet}) is smaller than stake_amount {stake}. "
+                f"Wallet is calculated as `dry_run_wallet * tradable_balance_ratio`."
+                )
 
     return config
 
@@ -128,3 +132,27 @@ def start_edge(args: Dict[str, Any]) -> None:
     # Initialize Edge object
     edge_cli = EdgeCli(config)
     edge_cli.start()
+
+
+def start_lookahead_analysis(args: Dict[str, Any]) -> None:
+    """
+    Start the backtest bias tester script
+    :param args: Cli args from Arguments()
+    :return: None
+    """
+    from freqtrade.optimize.analysis.lookahead_helpers import LookaheadAnalysisSubFunctions
+
+    config = setup_utils_configuration(args, RunMode.UTIL_NO_EXCHANGE)
+    LookaheadAnalysisSubFunctions.start(config)
+
+
+def start_recursive_analysis(args: Dict[str, Any]) -> None:
+    """
+    Start the backtest recursive tester script
+    :param args: Cli args from Arguments()
+    :return: None
+    """
+    from freqtrade.optimize.analysis.recursive_helpers import RecursiveAnalysisSubFunctions
+
+    config = setup_utils_configuration(args, RunMode.UTIL_NO_EXCHANGE)
+    RecursiveAnalysisSubFunctions.start(config)

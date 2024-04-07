@@ -7,6 +7,7 @@ import pytest
 
 from freqtrade.commands import Arguments
 from freqtrade.commands.cli_options import check_int_nonzero, check_int_positive
+from tests.conftest import CURRENT_TEST_STRATEGY
 
 
 # Parse common command-line-arguments. Used for all tools
@@ -111,19 +112,19 @@ def test_parse_args_strategy_path_invalid() -> None:
 
 def test_parse_args_backtesting_invalid() -> None:
     with pytest.raises(SystemExit, match=r'2'):
-        Arguments(['backtesting --ticker-interval']).get_parsed_arg()
+        Arguments(['backtesting --timeframe']).get_parsed_arg()
 
     with pytest.raises(SystemExit, match=r'2'):
-        Arguments(['backtesting --ticker-interval', 'abc']).get_parsed_arg()
+        Arguments(['backtesting --timeframe', 'abc']).get_parsed_arg()
 
 
 def test_parse_args_backtesting_custom() -> None:
     args = [
         'backtesting',
         '-c', 'test_conf.json',
-        '--ticker-interval', '1m',
+        '--timeframe', '1m',
         '--strategy-list',
-        'StrategyTestV2',
+        CURRENT_TEST_STRATEGY,
         'SampleStrategy'
     ]
     call_args = Arguments(args).get_parsed_arg()
@@ -132,7 +133,7 @@ def test_parse_args_backtesting_custom() -> None:
     assert call_args['command'] == 'backtesting'
     assert call_args['func'] is not None
     assert call_args['timeframe'] == '1m'
-    assert type(call_args['strategy_list']) is list
+    assert isinstance(call_args['strategy_list'], list)
     assert len(call_args['strategy_list']) == 2
 
 
@@ -172,7 +173,7 @@ def test_download_data_options() -> None:
 def test_plot_dataframe_options() -> None:
     args = [
         'plot-dataframe',
-        '-c', 'config_examples/config_bittrex.example.json',
+        '-c', 'tests/testdata/testconfigs/main_test_config.json',
         '--indicators1', 'sma10', 'sma100',
         '--indicators2', 'macd', 'fastd', 'fastk',
         '--plot-limit', '30',

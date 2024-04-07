@@ -5,11 +5,15 @@ from typing import Any, Dict, List
 
 from questionary import Separator, prompt
 
+from freqtrade.configuration import sanitize_config
+from freqtrade.configuration.config_setup import setup_utils_configuration
+from freqtrade.configuration.detect_environment import running_in_docker
 from freqtrade.configuration.directory_operations import chown_user_directory
 from freqtrade.constants import UNLIMITED_STAKE_AMOUNT
+from freqtrade.enums import RunMode
 from freqtrade.exceptions import OperationalException
 from freqtrade.exchange import MAP_EXCHANGE_CHILDCLASS, available_exchanges
-from freqtrade.misc import render_template
+from freqtrade.util import render_template
 
 
 logger = logging.getLogger(__name__)
@@ -67,7 +71,7 @@ def ask_user_config() -> Dict[str, Any]:
             "type": "text",
             "name": "stake_amount",
             "message": f"Please insert your stake amount (Number or '{UNLIMITED_STAKE_AMOUNT}'):",
-            "default": "100",
+            "default": "unlimited",
             "validate": lambda val: val == UNLIMITED_STAKE_AMOUNT or validate_is_float(val),
             "filter": lambda val: '"' + UNLIMITED_STAKE_AMOUNT + '"'
             if val == UNLIMITED_STAKE_AMOUNT
@@ -76,17 +80,14 @@ def ask_user_config() -> Dict[str, Any]:
         {
             "type": "text",
             "name": "max_open_trades",
-            "message": f"Please insert max_open_trades (Integer or '{UNLIMITED_STAKE_AMOUNT}'):",
+            "message": "Please insert max_open_trades (Integer or -1 for unlimited open trades):",
             "default": "3",
-            "validate": lambda val: val == UNLIMITED_STAKE_AMOUNT or validate_is_int(val),
-            "filter": lambda val: '"' + UNLIMITED_STAKE_AMOUNT + '"'
-            if val == UNLIMITED_STAKE_AMOUNT
-            else val
+            "validate": lambda val: validate_is_int(val)
         },
         {
             "type": "select",
             "name": "timeframe_in_config",
-            "message": "Tim",
+            "message": "Time",
             "choices": ["Have the strategy define timeframe.", "Override in configuration."]
         },
         {
@@ -110,15 +111,22 @@ def ask_user_config() -> Dict[str, Any]:
             "choices": [
                 "binance",
                 "binanceus",
-                "bittrex",
+                "gate",
+                "htx",
                 "kraken",
-                "ftx",
                 "kucoin",
-                "gateio",
-                "okex",
-                Separator(),
+                "okx",
+                Separator("------------------"),
                 "other",
             ],
+        },
+        {
+            "type": "confirm",
+            "name": "trading_mode",
+            "message": "Do you want to trade Perpetual Swaps (perpetual futures)?",
+            "default": False,
+            "filter": lambda val: 'futures' if val else 'spot',
+            "when": lambda x: x["exchange_name"] in ['binance', 'gate', 'okx'],
         },
         {
             "type": "autocomplete",
@@ -143,7 +151,7 @@ def ask_user_config() -> Dict[str, Any]:
             "type": "password",
             "name": "exchange_key_password",
             "message": "Insert Exchange API Key password",
-            "when": lambda x: not x['dry_run'] and x['exchange_name'] in ('kucoin', 'okex')
+            "when": lambda x: not x['dry_run'] and x['exchange_name'] in ('kucoin', 'okx')
         },
         {
             "type": "confirm",
@@ -158,7 +166,7 @@ def ask_user_config() -> Dict[str, Any]:
             "when": lambda x: x['telegram']
         },
         {
-            "type": "text",
+            "type": "password",
             "name": "telegram_chat_id",
             "message": "Insert Telegram chat id",
             "when": lambda x: x['telegram']
@@ -174,7 +182,7 @@ def ask_user_config() -> Dict[str, Any]:
             "name": "api_server_listen_addr",
             "message": ("Insert Api server Listen Address (0.0.0.0 for docker, "
                         "otherwise best left untouched)"),
-            "default": "127.0.0.1",
+            "default": "127.0.0.1" if not running_in_docker() else "0.0.0.0",
             "when": lambda x: x['api_server']
         },
         {
@@ -185,7 +193,7 @@ def ask_user_config() -> Dict[str, Any]:
             "when": lambda x: x['api_server']
         },
         {
-            "type": "text",
+            "type": "password",
             "name": "api_server_password",
             "message": "Insert api-server password",
             "when": lambda x: x['api_server']
@@ -196,9 +204,16 @@ def ask_user_config() -> Dict[str, Any]:
     if not answers:
         # Interrupted questionary sessions return an empty dict.
         raise OperationalException("User interrupted interactive questions.")
-
+    # Ensure default is set for non-futures exchanges
+    answers['trading_mode'] = answers.get('trading_mode', "spot")
+    answers['margin_mode'] = (
+        'isolated'
+        if answers.get('trading_mode') == 'futures'
+        else ''
+    )
     # Force JWT token to be a random string
     answers['api_server_jwt_key'] = secrets.token_hex()
+    answers['api_server_ws_token'] = secrets.token_urlsafe(25)
 
     return answers
 
@@ -252,3 +267,19 @@ def start_new_config(args: Dict[str, Any]) -> None:
                 "Please delete it or use a different configuration file name.")
     selections = ask_user_config()
     deploy_new_config(config_path, selections)
+
+
+def start_show_config(args: Dict[str, Any]) -> None:
+
+    config = setup_utils_configuration(args, RunMode.UTIL_EXCHANGE, set_dry=False)
+
+    # TODO: Sanitize from sensitive info before printing
+
+    print("Your combined configuration is:")
+    config_sanitized = sanitize_config(
+        config['original_config'],
+        show_sensitive=args.get('show_sensitive', False)
+    )
+
+    from rich import print_json
+    print_json(data=config_sanitized)

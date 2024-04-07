@@ -1,7 +1,5 @@
 # pragma pylint: disable=missing-docstring, protected-access, invalid-name
 import json
-import logging
-import sys
 import warnings
 from copy import deepcopy
 from pathlib import Path
@@ -11,19 +9,21 @@ import pytest
 from jsonschema import ValidationError
 
 from freqtrade.commands import Arguments
-from freqtrade.configuration import Configuration, check_exchange, validate_config_consistency
+from freqtrade.configuration import Configuration, validate_config_consistency
+from freqtrade.configuration.config_secrets import sanitize_config
 from freqtrade.configuration.config_validation import validate_config_schema
 from freqtrade.configuration.deprecated_settings import (check_conflicting_settings,
                                                          process_deprecated_setting,
                                                          process_removed_setting,
                                                          process_temporary_deprecated_settings)
-from freqtrade.configuration.environment_vars import flat_vars_to_nested_dict
-from freqtrade.configuration.load_config import load_config_file, load_file, log_config_error_range
+from freqtrade.configuration.environment_vars import _flat_vars_to_nested_dict
+from freqtrade.configuration.load_config import (load_config_file, load_file, load_from_files,
+                                                 log_config_error_range)
 from freqtrade.constants import DEFAULT_DB_DRYRUN_URL, DEFAULT_DB_PROD_URL, ENV_VAR_PREFIX
 from freqtrade.enums import RunMode
 from freqtrade.exceptions import OperationalException
-from freqtrade.loggers import _set_loggers, setup_logging, setup_logging_pre
-from tests.conftest import log_has, log_has_re, patched_configuration_load_config_file
+from tests.conftest import (CURRENT_TEST_STRATEGY, log_has, log_has_re,
+                            patched_configuration_load_config_file)
 
 
 @pytest.fixture(scope="function")
@@ -56,7 +56,8 @@ def test_load_config_incorrect_stake_amount(default_conf) -> None:
 
 def test_load_config_file(default_conf, mocker, caplog) -> None:
     del default_conf['user_data_dir']
-    file_mock = mocker.patch('freqtrade.configuration.load_config.open', mocker.mock_open(
+    default_conf['datadir'] = str(default_conf['datadir'])
+    file_mock = mocker.patch('freqtrade.configuration.load_config.Path.open', mocker.mock_open(
         read_data=json.dumps(default_conf)
     ))
 
@@ -67,9 +68,11 @@ def test_load_config_file(default_conf, mocker, caplog) -> None:
 
 def test_load_config_file_error(default_conf, mocker, caplog) -> None:
     del default_conf['user_data_dir']
+    default_conf['datadir'] = str(default_conf['datadir'])
     filedata = json.dumps(default_conf).replace(
         '"stake_amount": 0.001,', '"stake_amount": .001,')
-    mocker.patch('freqtrade.configuration.load_config.open', mocker.mock_open(read_data=filedata))
+    mocker.patch('freqtrade.configuration.load_config.Path.open',
+                 mocker.mock_open(read_data=filedata))
     mocker.patch.object(Path, "read_text", MagicMock(return_value=filedata))
 
     with pytest.raises(OperationalException, match=r".*Please verify the following segment.*"):
@@ -78,6 +81,7 @@ def test_load_config_file_error(default_conf, mocker, caplog) -> None:
 
 def test_load_config_file_error_range(default_conf, mocker, caplog) -> None:
     del default_conf['user_data_dir']
+    default_conf['datadir'] = str(default_conf['datadir'])
     filedata = json.dumps(default_conf).replace(
         '"stake_amount": 0.001,', '"stake_amount": .001,')
     mocker.patch.object(Path, "read_text", MagicMock(return_value=filedata))
@@ -101,8 +105,8 @@ def test_load_config_file_error_range(default_conf, mocker, caplog) -> None:
     assert x == ''
 
 
-def test_load_file_error(tmpdir):
-    testpath = Path(tmpdir) / 'config.json'
+def test_load_file_error(tmp_path):
+    testpath = tmp_path / 'config.json'
     with pytest.raises(OperationalException, match=r"File .* not found!"):
         load_file(testpath)
 
@@ -159,7 +163,7 @@ def test_load_config_combine_dicts(default_conf, mocker, caplog) -> None:
 
     configsmock = MagicMock(side_effect=config_files)
     mocker.patch(
-        'freqtrade.configuration.configuration.load_config_file',
+        'freqtrade.configuration.load_config.load_config_file',
         configsmock
     )
 
@@ -190,7 +194,7 @@ def test_from_config(default_conf, mocker, caplog) -> None:
     mocker.patch('freqtrade.configuration.configuration.create_datadir', lambda c, x: x)
 
     configsmock = MagicMock(side_effect=config_files)
-    mocker.patch('freqtrade.configuration.configuration.load_config_file', configsmock)
+    mocker.patch('freqtrade.configuration.load_config.load_config_file', configsmock)
 
     validated_conf = Configuration.from_files(['test_conf.json', 'test2_conf.json'])
 
@@ -205,15 +209,43 @@ def test_from_config(default_conf, mocker, caplog) -> None:
     assert isinstance(validated_conf['user_data_dir'], Path)
 
 
+def test_from_recursive_files(testdatadir) -> None:
+    files = testdatadir / "testconfigs/testconfig.json"
+
+    conf = Configuration.from_files([files])
+
+    assert conf
+    # Exchange comes from "the first config"
+    assert conf['exchange']
+    # Pricing comes from the 2nd config
+    assert conf['entry_pricing']
+    assert conf['entry_pricing']['price_side'] == "same"
+    assert conf['exit_pricing']
+    # The other key comes from pricing2, which is imported by pricing.json.
+    # pricing.json is a level higher, therefore wins.
+    assert conf['exit_pricing']['price_side'] == "same"
+
+    assert len(conf['config_files']) == 4
+    assert 'testconfig.json' in conf['config_files'][0]
+    assert 'test_pricing_conf.json' in conf['config_files'][1]
+    assert 'test_base_config.json' in conf['config_files'][2]
+    assert 'test_pricing2_conf.json' in conf['config_files'][3]
+
+    files = testdatadir / "testconfigs/recursive.json"
+    with pytest.raises(OperationalException, match="Config loop detected."):
+        load_from_files([files])
+
+
 def test_print_config(default_conf, mocker, caplog) -> None:
     conf1 = deepcopy(default_conf)
     # Delete non-json elements from default_conf
     del conf1['user_data_dir']
+    conf1['datadir'] = str(conf1['datadir'])
     config_files = [conf1]
 
     configsmock = MagicMock(side_effect=config_files)
     mocker.patch('freqtrade.configuration.configuration.create_datadir', lambda c, x: x)
-    mocker.patch('freqtrade.configuration.configuration.load_config_file', configsmock)
+    mocker.patch('freqtrade.configuration.configuration.load_from_files', configsmock)
 
     validated_conf = Configuration.from_files(['test_conf.json'])
 
@@ -239,7 +271,7 @@ def test_load_config_max_open_trades_minus_one(default_conf, mocker, caplog) -> 
 
 def test_load_config_file_exception(mocker) -> None:
     mocker.patch(
-        'freqtrade.configuration.configuration.open',
+        'freqtrade.configuration.configuration.Path.open',
         MagicMock(side_effect=FileNotFoundError('File not found'))
     )
 
@@ -403,7 +435,7 @@ def test_setup_configuration_without_arguments(mocker, default_conf, caplog) -> 
     arglist = [
         'backtesting',
         '--config', 'config.json',
-        '--strategy', 'StrategyTestV2',
+        '--strategy', CURRENT_TEST_STRATEGY,
     ]
 
     args = Arguments(arglist).get_parsed_arg()
@@ -440,10 +472,10 @@ def test_setup_configuration_with_arguments(mocker, default_conf, caplog) -> Non
     arglist = [
         'backtesting',
         '--config', 'config.json',
-        '--strategy', 'StrategyTestV2',
+        '--strategy', CURRENT_TEST_STRATEGY,
         '--datadir', '/foo/bar',
         '--userdir', "/tmp/freqtrade",
-        '--ticker-interval', '1m',
+        '--timeframe', '1m',
         '--enable-position-stacking',
         '--disable-max-market-positions',
         '--timerange', ':100',
@@ -494,10 +526,10 @@ def test_setup_configuration_with_stratlist(mocker, default_conf, caplog) -> Non
     arglist = [
         'backtesting',
         '--config', 'config.json',
-        '--ticker-interval', '1m',
+        '--timeframe', '1m',
         '--export', 'trades',
         '--strategy-list',
-        'StrategyTestV2',
+        CURRENT_TEST_STRATEGY,
         'TestStrategy'
     ]
 
@@ -555,72 +587,11 @@ def test_hyperopt_with_arguments(mocker, default_conf, caplog) -> None:
     assert config['runmode'] == RunMode.HYPEROPT
 
 
-def test_check_exchange(default_conf, caplog) -> None:
-    # Test an officially supported by Freqtrade team exchange
-    default_conf['runmode'] = RunMode.DRY_RUN
-    default_conf.get('exchange').update({'name': 'BITTREX'})
-    assert check_exchange(default_conf)
-    assert log_has_re(r"Exchange .* is officially supported by the Freqtrade development team\.",
-                      caplog)
-    caplog.clear()
-
-    # Test an officially supported by Freqtrade team exchange
-    default_conf.get('exchange').update({'name': 'binance'})
-    assert check_exchange(default_conf)
-    assert log_has_re(r"Exchange .* is officially supported by the Freqtrade development team\.",
-                      caplog)
-    caplog.clear()
-
-    # Test an available exchange, supported by ccxt
-    default_conf.get('exchange').update({'name': 'huobipro'})
-    assert check_exchange(default_conf)
-    assert log_has_re(r"Exchange .* is known to the the ccxt library, available for the bot, "
-                      r"but not officially supported "
-                      r"by the Freqtrade development team\. .*", caplog)
-    caplog.clear()
-
-    # Test a 'bad' exchange, which known to have serious problems
-    default_conf.get('exchange').update({'name': 'bitmex'})
-    with pytest.raises(OperationalException,
-                       match=r"Exchange .* will not work with Freqtrade\..*"):
-        check_exchange(default_conf)
-    caplog.clear()
-
-    # Test a 'bad' exchange with check_for_bad=False
-    default_conf.get('exchange').update({'name': 'bitmex'})
-    assert check_exchange(default_conf, False)
-    assert log_has_re(r"Exchange .* is known to the the ccxt library, available for the bot, "
-                      r"but not officially supported "
-                      r"by the Freqtrade development team\. .*", caplog)
-    caplog.clear()
-
-    # Test an invalid exchange
-    default_conf.get('exchange').update({'name': 'unknown_exchange'})
-    with pytest.raises(
-        OperationalException,
-        match=r'Exchange "unknown_exchange" is not known to the ccxt library '
-              r'and therefore not available for the bot.*'
-    ):
-        check_exchange(default_conf)
-
-    # Test no exchange...
-    default_conf.get('exchange').update({'name': ''})
-    default_conf['runmode'] = RunMode.PLOT
-    assert check_exchange(default_conf)
-
-    # Test no exchange...
-    default_conf.get('exchange').update({'name': ''})
-    default_conf['runmode'] = RunMode.UTIL_EXCHANGE
-    with pytest.raises(OperationalException,
-                       match=r'This command requires a configured exchange.*'):
-        check_exchange(default_conf)
-
-
 def test_cli_verbose_with_params(default_conf, mocker, caplog) -> None:
     patched_configuration_load_config_file(mocker, default_conf)
 
     # Prevent setting loggers
-    mocker.patch('freqtrade.loggers._set_loggers', MagicMock)
+    mocker.patch('freqtrade.loggers.set_loggers', MagicMock)
     arglist = ['trade', '-vvv']
     args = Arguments(arglist).get_parsed_arg()
 
@@ -631,129 +602,9 @@ def test_cli_verbose_with_params(default_conf, mocker, caplog) -> None:
     assert log_has('Verbosity set to 3', caplog)
 
 
-def test_set_loggers() -> None:
-    # Reset Logging to Debug, otherwise this fails randomly as it's set globally
-    logging.getLogger('requests').setLevel(logging.DEBUG)
-    logging.getLogger("urllib3").setLevel(logging.DEBUG)
-    logging.getLogger('ccxt.base.exchange').setLevel(logging.DEBUG)
-    logging.getLogger('telegram').setLevel(logging.DEBUG)
-
-    previous_value1 = logging.getLogger('requests').level
-    previous_value2 = logging.getLogger('ccxt.base.exchange').level
-    previous_value3 = logging.getLogger('telegram').level
-
-    _set_loggers()
-
-    value1 = logging.getLogger('requests').level
-    assert previous_value1 is not value1
-    assert value1 is logging.INFO
-
-    value2 = logging.getLogger('ccxt.base.exchange').level
-    assert previous_value2 is not value2
-    assert value2 is logging.INFO
-
-    value3 = logging.getLogger('telegram').level
-    assert previous_value3 is not value3
-    assert value3 is logging.INFO
-
-    _set_loggers(verbosity=2)
-
-    assert logging.getLogger('requests').level is logging.DEBUG
-    assert logging.getLogger('ccxt.base.exchange').level is logging.INFO
-    assert logging.getLogger('telegram').level is logging.INFO
-    assert logging.getLogger('werkzeug').level is logging.INFO
-
-    _set_loggers(verbosity=3, api_verbosity='error')
-
-    assert logging.getLogger('requests').level is logging.DEBUG
-    assert logging.getLogger('ccxt.base.exchange').level is logging.DEBUG
-    assert logging.getLogger('telegram').level is logging.INFO
-    assert logging.getLogger('werkzeug').level is logging.ERROR
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="does not run on windows")
-def test_set_loggers_syslog():
-    logger = logging.getLogger()
-    orig_handlers = logger.handlers
-    logger.handlers = []
-
-    config = {'verbosity': 2,
-              'logfile': 'syslog:/dev/log',
-              }
-
-    setup_logging_pre()
-    setup_logging(config)
-    assert len(logger.handlers) == 3
-    assert [x for x in logger.handlers if type(x) == logging.handlers.SysLogHandler]
-    assert [x for x in logger.handlers if type(x) == logging.StreamHandler]
-    assert [x for x in logger.handlers if type(x) == logging.handlers.BufferingHandler]
-    # setting up logging again should NOT cause the loggers to be added a second time.
-    setup_logging(config)
-    assert len(logger.handlers) == 3
-    # reset handlers to not break pytest
-    logger.handlers = orig_handlers
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="does not run on windows")
-def test_set_loggers_Filehandler(tmpdir):
-    logger = logging.getLogger()
-    orig_handlers = logger.handlers
-    logger.handlers = []
-    logfile = Path(tmpdir) / 'ft_logfile.log'
-    config = {'verbosity': 2,
-              'logfile': str(logfile),
-              }
-
-    setup_logging_pre()
-    setup_logging(config)
-    assert len(logger.handlers) == 3
-    assert [x for x in logger.handlers if type(x) == logging.handlers.RotatingFileHandler]
-    assert [x for x in logger.handlers if type(x) == logging.StreamHandler]
-    assert [x for x in logger.handlers if type(x) == logging.handlers.BufferingHandler]
-    # setting up logging again should NOT cause the loggers to be added a second time.
-    setup_logging(config)
-    assert len(logger.handlers) == 3
-    # reset handlers to not break pytest
-    if logfile.exists:
-        logfile.unlink()
-    logger.handlers = orig_handlers
-
-
-@pytest.mark.skip(reason="systemd is not installed on every system, so we're not testing this.")
-def test_set_loggers_journald(mocker):
-    logger = logging.getLogger()
-    orig_handlers = logger.handlers
-    logger.handlers = []
-
-    config = {'verbosity': 2,
-              'logfile': 'journald',
-              }
-
-    setup_logging(config)
-    assert len(logger.handlers) == 2
-    assert [x for x in logger.handlers if type(x).__name__ == "JournaldLogHandler"]
-    assert [x for x in logger.handlers if type(x) == logging.StreamHandler]
-    # reset handlers to not break pytest
-    logger.handlers = orig_handlers
-
-
-def test_set_loggers_journald_importerror(mocker, import_fails):
-    logger = logging.getLogger()
-    orig_handlers = logger.handlers
-    logger.handlers = []
-
-    config = {'verbosity': 2,
-              'logfile': 'journald',
-              }
-    with pytest.raises(OperationalException,
-                       match=r'You need the systemd python package.*'):
-        setup_logging(config)
-    logger.handlers = orig_handlers
-
-
-def test_set_logfile(default_conf, mocker, tmpdir):
+def test_set_logfile(default_conf, mocker, tmp_path):
     patched_configuration_load_config_file(mocker, default_conf)
-    f = Path(tmpdir / "test_file.log")
+    f = tmp_path / "test_file.log"
     assert not f.is_file()
     arglist = [
         'trade', '--logfile', str(f),
@@ -771,15 +622,15 @@ def test_set_logfile(default_conf, mocker, tmpdir):
 
 
 def test_load_config_warn_forcebuy(default_conf, mocker, caplog) -> None:
-    default_conf['forcebuy_enable'] = True
+    default_conf['force_entry_enable'] = True
     patched_configuration_load_config_file(mocker, default_conf)
 
     args = Arguments(['trade']).get_parsed_arg()
     configuration = Configuration(args)
     validated_conf = configuration.load_config()
 
-    assert validated_conf.get('forcebuy_enable')
-    assert log_has('`forcebuy` RPC message enabled.', caplog)
+    assert validated_conf.get('force_entry_enable')
+    assert log_has('`force_entry_enable` RPC message enabled.', caplog)
 
 
 def test_validate_default_conf(default_conf) -> None:
@@ -797,8 +648,8 @@ def test_validate_max_open_trades(default_conf):
 
 def test_validate_price_side(default_conf):
     default_conf['order_types'] = {
-        "buy": "limit",
-        "sell": "limit",
+        "entry": "limit",
+        "exit": "limit",
         "stoploss": "limit",
         "stoploss_on_exchange": False,
     }
@@ -806,23 +657,23 @@ def test_validate_price_side(default_conf):
     validate_config_consistency(default_conf)
 
     conf = deepcopy(default_conf)
-    conf['order_types']['buy'] = 'market'
+    conf['order_types']['entry'] = 'market'
     with pytest.raises(OperationalException,
-                       match='Market buy orders require bid_strategy.price_side = "ask".'):
+                       match='Market entry orders require entry_pricing.price_side = "other".'):
         validate_config_consistency(conf)
 
     conf = deepcopy(default_conf)
-    conf['order_types']['sell'] = 'market'
+    conf['order_types']['exit'] = 'market'
     with pytest.raises(OperationalException,
-                       match='Market sell orders require ask_strategy.price_side = "bid".'):
+                       match='Market exit orders require exit_pricing.price_side = "other".'):
         validate_config_consistency(conf)
 
     # Validate inversed case
     conf = deepcopy(default_conf)
-    conf['order_types']['sell'] = 'market'
-    conf['order_types']['buy'] = 'market'
-    conf['ask_strategy']['price_side'] = 'bid'
-    conf['bid_strategy']['price_side'] = 'ask'
+    conf['order_types']['exit'] = 'market'
+    conf['order_types']['entry'] = 'market'
+    conf['exit_pricing']['price_side'] = 'bid'
+    conf['entry_pricing']['price_side'] = 'ask'
 
     validate_config_consistency(conf)
 
@@ -867,15 +718,15 @@ def test_validate_tsl(default_conf):
 
 def test_validate_edge2(edge_conf):
     edge_conf.update({
-        "use_sell_signal": True,
+        "use_exit_signal": True,
     })
     # Passes test
     validate_config_consistency(edge_conf)
 
     edge_conf.update({
-        "use_sell_signal": False,
+        "use_exit_signal": False,
     })
-    with pytest.raises(OperationalException, match="Edge requires `use_sell_signal` to be True, "
+    with pytest.raises(OperationalException, match="Edge requires `use_exit_signal` to be True, "
                        "otherwise no sells will happen."):
         validate_config_consistency(edge_conf)
 
@@ -925,19 +776,221 @@ def test_validate_protections(default_conf, protconf, expected):
 
 def test_validate_ask_orderbook(default_conf, caplog) -> None:
     conf = deepcopy(default_conf)
-    conf['ask_strategy']['use_order_book'] = True
-    conf['ask_strategy']['order_book_min'] = 2
-    conf['ask_strategy']['order_book_max'] = 2
+    conf['exit_pricing']['use_order_book'] = True
+    conf['exit_pricing']['order_book_min'] = 2
+    conf['exit_pricing']['order_book_max'] = 2
 
     validate_config_consistency(conf)
     assert log_has_re(r"DEPRECATED: Please use `order_book_top` instead of.*", caplog)
-    assert conf['ask_strategy']['order_book_top'] == 2
+    assert conf['exit_pricing']['order_book_top'] == 2
 
-    conf['ask_strategy']['order_book_max'] = 5
+    conf['exit_pricing']['order_book_max'] = 5
 
     with pytest.raises(OperationalException,
-                       match=r"Using order_book_max != order_book_min in ask_strategy.*"):
+                       match=r"Using order_book_max != order_book_min in exit_pricing.*"):
         validate_config_consistency(conf)
+
+
+def test_validate_time_in_force(default_conf, caplog) -> None:
+    conf = deepcopy(default_conf)
+    conf['order_time_in_force'] = {
+        'buy': 'gtc',
+        'sell': 'GTC',
+    }
+    validate_config_consistency(conf)
+    assert log_has_re(r"DEPRECATED: Using 'buy' and 'sell' for time_in_force is.*", caplog)
+    assert conf['order_time_in_force']['entry'] == 'gtc'
+    assert conf['order_time_in_force']['exit'] == 'GTC'
+
+    conf = deepcopy(default_conf)
+    conf['order_time_in_force'] = {
+        'buy': 'GTC',
+        'sell': 'GTC',
+    }
+    conf['trading_mode'] = 'futures'
+    with pytest.raises(OperationalException,
+                       match=r"Please migrate your time_in_force settings .* 'entry' and 'exit'\."):
+        validate_config_consistency(conf)
+
+
+def test__validate_order_types(default_conf, caplog) -> None:
+    conf = deepcopy(default_conf)
+    conf['order_types'] = {
+        'buy': 'limit',
+        'sell': 'market',
+        'forcesell': 'market',
+        'forcebuy': 'limit',
+        'stoploss': 'market',
+        'stoploss_on_exchange': False,
+    }
+    validate_config_consistency(conf)
+    assert log_has_re(r"DEPRECATED: Using 'buy' and 'sell' for order_types is.*", caplog)
+    assert conf['order_types']['entry'] == 'limit'
+    assert conf['order_types']['exit'] == 'market'
+    assert conf['order_types']['force_entry'] == 'limit'
+    assert 'buy' not in conf['order_types']
+    assert 'sell' not in conf['order_types']
+    assert 'forcebuy' not in conf['order_types']
+    assert 'forcesell' not in conf['order_types']
+
+    conf = deepcopy(default_conf)
+    conf['order_types'] = {
+        'buy': 'limit',
+        'sell': 'market',
+        'forcesell': 'market',
+        'forcebuy': 'limit',
+        'stoploss': 'market',
+        'stoploss_on_exchange': False,
+    }
+    conf['trading_mode'] = 'futures'
+    with pytest.raises(OperationalException,
+                       match=r"Please migrate your order_types settings to use the new wording\."):
+        validate_config_consistency(conf)
+
+
+def test__validate_unfilledtimeout(default_conf, caplog) -> None:
+    conf = deepcopy(default_conf)
+    conf['unfilledtimeout'] = {
+        'buy': 30,
+        'sell': 35,
+    }
+    validate_config_consistency(conf)
+    assert log_has_re(r"DEPRECATED: Using 'buy' and 'sell' for unfilledtimeout is.*", caplog)
+    assert conf['unfilledtimeout']['entry'] == 30
+    assert conf['unfilledtimeout']['exit'] == 35
+    assert 'buy' not in conf['unfilledtimeout']
+    assert 'sell' not in conf['unfilledtimeout']
+
+    conf = deepcopy(default_conf)
+    conf['unfilledtimeout'] = {
+        'buy': 30,
+        'sell': 35,
+    }
+    conf['trading_mode'] = 'futures'
+    with pytest.raises(
+            OperationalException,
+            match=r"Please migrate your unfilledtimeout settings to use the new wording\."):
+        validate_config_consistency(conf)
+
+
+def test__validate_pricing_rules(default_conf, caplog) -> None:
+    def_conf = deepcopy(default_conf)
+    del def_conf['entry_pricing']
+    del def_conf['exit_pricing']
+
+    def_conf['ask_strategy'] = {
+        'price_side': 'ask',
+        'use_order_book': True,
+        'bid_last_balance': 0.5
+    }
+    def_conf['bid_strategy'] = {
+        'price_side': 'bid',
+        'use_order_book': False,
+        'ask_last_balance': 0.7
+    }
+    conf = deepcopy(def_conf)
+
+    validate_config_consistency(conf)
+    assert log_has_re(
+        r"DEPRECATED: Using 'ask_strategy' and 'bid_strategy' is.*", caplog)
+    assert conf['exit_pricing']['price_side'] == 'ask'
+    assert conf['exit_pricing']['use_order_book'] is True
+    assert conf['exit_pricing']['price_last_balance'] == 0.5
+    assert conf['entry_pricing']['price_side'] == 'bid'
+    assert conf['entry_pricing']['use_order_book'] is False
+    assert conf['entry_pricing']['price_last_balance'] == 0.7
+    assert 'ask_strategy' not in conf
+    assert 'bid_strategy' not in conf
+
+    conf = deepcopy(def_conf)
+
+    conf['trading_mode'] = 'futures'
+    with pytest.raises(
+            OperationalException,
+            match=r"Please migrate your pricing settings to use the new wording\."):
+        validate_config_consistency(conf)
+
+
+def test__validate_freqai_include_timeframes(default_conf, caplog) -> None:
+    conf = deepcopy(default_conf)
+    conf.update({
+            "freqai": {
+                "enabled": True,
+                "feature_parameters": {
+                    "include_timeframes": ["1m", "5m"],
+                    "include_corr_pairlist": [],
+                },
+                "data_split_parameters": {},
+                "model_training_parameters": {}
+            }
+    })
+    with pytest.raises(OperationalException, match=r"Main timeframe of .*"):
+        validate_config_consistency(conf)
+    # Validation pass
+    conf.update({'timeframe': '1m'})
+    validate_config_consistency(conf)
+
+    # Ensure base timeframe is in include_timeframes
+    conf['freqai']['feature_parameters']['include_timeframes'] = ["5m", "15m"]
+    validate_config_consistency(conf)
+    assert conf['freqai']['feature_parameters']['include_timeframes'] == ["1m", "5m", "15m"]
+
+    conf.update({'analyze_per_epoch': True})
+    with pytest.raises(OperationalException,
+                       match=r"Using analyze-per-epoch .* not supported with a FreqAI strategy."):
+        validate_config_consistency(conf)
+
+
+def test__validate_consumers(default_conf, caplog) -> None:
+    conf = deepcopy(default_conf)
+    conf.update({
+            "external_message_consumer": {
+                "enabled": True,
+                "producers": []
+                }
+            })
+    with pytest.raises(OperationalException,
+                       match="You must specify at least 1 Producer to connect to."):
+        validate_config_consistency(conf)
+
+    conf = deepcopy(default_conf)
+    conf.update({
+        "external_message_consumer": {
+            "enabled": True,
+            "producers": [
+                {
+                    "name": "default",
+                    "host": "127.0.0.1",
+                    "port": 8081,
+                    "ws_token": "secret_ws_t0ken."
+                }, {
+                    "name": "default",
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "ws_token": "secret_ws_t0ken."
+                }
+            ]}
+        })
+    with pytest.raises(OperationalException,
+                       match="Producer names must be unique. Duplicate: default"):
+        validate_config_consistency(conf)
+
+    conf = deepcopy(default_conf)
+    conf.update({
+        "process_only_new_candles": True,
+        "external_message_consumer": {
+            "enabled": True,
+            "producers": [
+                {
+                    "name": "default",
+                    "host": "127.0.0.1",
+                    "port": 8081,
+                    "ws_token": "secret_ws_t0ken."
+                }
+            ]}
+        })
+    validate_config_consistency(conf)
+    assert log_has_re("To receive best performance with external data.*", caplog)
 
 
 def test_load_config_test_comments() -> None:
@@ -986,8 +1039,7 @@ def test_load_config_stoploss_exchange_limit_ratio(all_conf) -> None:
         validate_config_schema(all_conf)
 
 
-@pytest.mark.parametrize("keys", [("exchange", "sandbox", False),
-                                  ("exchange", "key", ""),
+@pytest.mark.parametrize("keys", [("exchange", "key", ""),
                                   ("exchange", "secret", ""),
                                   ("exchange", "password", ""),
                                   ])
@@ -1094,7 +1146,7 @@ def test_pairlist_resolving_with_config_pl_not_exists(mocker, default_conf):
         configuration.get_config()
 
 
-def test_pairlist_resolving_fallback(mocker):
+def test_pairlist_resolving_fallback(mocker, tmp_path):
     mocker.patch.object(Path, "exists", MagicMock(return_value=True))
     mocker.patch.object(Path, "open", MagicMock(return_value=MagicMock()))
     mocker.patch("freqtrade.configuration.configuration.load_file",
@@ -1113,18 +1165,12 @@ def test_pairlist_resolving_fallback(mocker):
 
     assert config['pairs'] == ['ETH/BTC', 'XRP/BTC']
     assert config['exchange']['name'] == 'binance'
-    assert config['datadir'] == Path.cwd() / "user_data/data/binance"
+    assert config['datadir'] == tmp_path / "user_data/data/binance"
 
 
 @pytest.mark.parametrize("setting", [
-    ("ask_strategy", "use_sell_signal", True,
-     None, "use_sell_signal", False),
-    ("ask_strategy", "sell_profit_only", True,
-     None, "sell_profit_only", False),
-    ("ask_strategy", "sell_profit_offset", 0.1,
-     None, "sell_profit_offset", 0.01),
-    ("ask_strategy", "ignore_roi_if_buy_signal", True,
-     None, "ignore_roi_if_buy_signal", False),
+    ("webhook", "webhookbuy", 'testWEbhook',
+     "webhook", "webhookentry", 'testWEbhook'),
     ("ask_strategy", "ignore_buying_expired_candle_after", 5,
      None, "ignore_buying_expired_candle_after", 6),
 ])
@@ -1257,11 +1303,14 @@ def test_process_deprecated_setting(mocker, default_conf, caplog):
     # The value of the new setting shall have been set to the
     # value of the deprecated one
     assert default_conf['sectionA']['new_setting'] == 'valB'
+    # Old setting is removed
+    assert 'deprecated_setting' not in default_conf['sectionB']
 
     caplog.clear()
 
     # Delete new setting (deprecated exists)
     del default_conf['sectionA']['new_setting']
+    default_conf['sectionB']['deprecated_setting'] = 'valB'
     process_deprecated_setting(default_conf,
                                'sectionB', 'deprecated_setting',
                                'sectionA', 'new_setting')
@@ -1275,7 +1324,7 @@ def test_process_deprecated_setting(mocker, default_conf, caplog):
     # Assign new setting
     default_conf['sectionA']['new_setting'] = 'valA'
     # Delete deprecated setting
-    del default_conf['sectionB']['deprecated_setting']
+    default_conf['sectionB'].pop('deprecated_setting', None)
     process_deprecated_setting(default_conf,
                                'sectionB', 'deprecated_setting',
                                'sectionA', 'new_setting')
@@ -1320,22 +1369,14 @@ def test_process_removed_setting(mocker, default_conf, caplog):
 def test_process_deprecated_ticker_interval(default_conf, caplog):
     message = "DEPRECATED: Please use 'timeframe' instead of 'ticker_interval."
     config = deepcopy(default_conf)
+
     process_temporary_deprecated_settings(config)
     assert not log_has(message, caplog)
 
     del config['timeframe']
     config['ticker_interval'] = '15m'
-    process_temporary_deprecated_settings(config)
-    assert log_has(message, caplog)
-    assert config['ticker_interval'] == '15m'
-
-    config = deepcopy(default_conf)
-    # Have both timeframe and ticker interval in config
-    # Can also happen when using ticker_interval in configuration, and --timeframe as cli argument
-    config['timeframe'] = '5m'
-    config['ticker_interval'] = '4h'
     with pytest.raises(OperationalException,
-                       match=r"Both 'timeframe' and 'ticker_interval' detected."):
+                       match=r"DEPRECATED: 'ticker_interval' detected. Please use.*"):
         process_temporary_deprecated_settings(config)
 
 
@@ -1356,15 +1397,15 @@ def test_flat_vars_to_nested_dict(caplog):
         'FREQTRADE__EXCHANGE__SOME_SETTING': 'true',
         'FREQTRADE__EXCHANGE__SOME_FALSE_SETTING': 'false',
         'FREQTRADE__EXCHANGE__CONFIG__whatever': 'sometime',
-        'FREQTRADE__ASK_STRATEGY__PRICE_SIDE': 'bid',
-        'FREQTRADE__ASK_STRATEGY__cccc': '500',
+        'FREQTRADE__EXIT_PRICING__PRICE_SIDE': 'bid',
+        'FREQTRADE__EXIT_PRICING__cccc': '500',
         'FREQTRADE__STAKE_AMOUNT': '200.05',
         'FREQTRADE__TELEGRAM__CHAT_ID': '2151',
         'NOT_RELEVANT': '200.0',  # Will be ignored
     }
     expected = {
         'stake_amount': 200.05,
-        'ask_strategy': {
+        'exit_pricing': {
             'price_side': 'bid',
             'cccc': 500,
         },
@@ -1379,8 +1420,104 @@ def test_flat_vars_to_nested_dict(caplog):
             'chat_id': '2151'
         }
     }
-    res = flat_vars_to_nested_dict(test_args, ENV_VAR_PREFIX)
+    res = _flat_vars_to_nested_dict(test_args, ENV_VAR_PREFIX)
     assert res == expected
 
     assert log_has("Loading variable 'FREQTRADE__EXCHANGE__SOME_SETTING'", caplog)
     assert not log_has("Loading variable 'NOT_RELEVANT'", caplog)
+
+
+def test_setup_hyperopt_freqai(mocker, default_conf) -> None:
+    patched_configuration_load_config_file(mocker, default_conf)
+    mocker.patch(
+        'freqtrade.configuration.configuration.create_datadir',
+        lambda c, x: x
+    )
+    mocker.patch(
+        'freqtrade.configuration.configuration.create_userdata_dir',
+        lambda x, *args, **kwargs: Path(x)
+    )
+    arglist = [
+        'hyperopt',
+        '--config', 'config.json',
+        '--strategy', CURRENT_TEST_STRATEGY,
+        '--timerange', '20220801-20220805',
+        "--freqaimodel",
+        "LightGBMRegressorMultiTarget",
+        "--analyze-per-epoch"
+    ]
+
+    args = Arguments(arglist).get_parsed_arg()
+
+    configuration = Configuration(args)
+    config = configuration.get_config()
+    config['freqai'] = {
+        "enabled": True
+    }
+    with pytest.raises(
+        OperationalException, match=r".*analyze-per-epoch parameter is not supported.*"
+    ):
+        validate_config_consistency(config)
+
+
+def test_setup_freqai_backtesting(mocker, default_conf) -> None:
+    patched_configuration_load_config_file(mocker, default_conf)
+    mocker.patch(
+        'freqtrade.configuration.configuration.create_datadir',
+        lambda c, x: x
+    )
+    mocker.patch(
+        'freqtrade.configuration.configuration.create_userdata_dir',
+        lambda x, *args, **kwargs: Path(x)
+    )
+    arglist = [
+        'backtesting',
+        '--config', 'config.json',
+        '--strategy', CURRENT_TEST_STRATEGY,
+        '--timerange', '20220801-20220805',
+        "--freqaimodel",
+        "LightGBMRegressorMultiTarget",
+        "--freqai-backtest-live-models"
+    ]
+
+    args = Arguments(arglist).get_parsed_arg()
+
+    configuration = Configuration(args)
+    config = configuration.get_config()
+    config['runmode'] = RunMode.BACKTEST
+
+    with pytest.raises(
+        OperationalException, match=r".*--freqai-backtest-live-models parameter is only.*"
+    ):
+        validate_config_consistency(config)
+
+    conf = deepcopy(config)
+    conf['freqai'] = {
+        "enabled": True
+    }
+    with pytest.raises(
+        OperationalException, match=r".* timerange parameter is not supported with .*"
+    ):
+        validate_config_consistency(conf)
+
+    conf['timerange'] = None
+    conf['freqai_backtest_live_models'] = False
+
+    with pytest.raises(
+        OperationalException, match=r".* pass --timerange if you intend to use FreqAI .*"
+    ):
+        validate_config_consistency(conf)
+
+
+def test_sanitize_config(default_conf_usdt):
+    assert default_conf_usdt['exchange']['key'] != 'REDACTED'
+    res = sanitize_config(default_conf_usdt)
+    # Didn't modify original dict
+    assert default_conf_usdt['exchange']['key'] != 'REDACTED'
+
+    assert res['exchange']['key'] == 'REDACTED'
+    assert res['exchange']['secret'] == 'REDACTED'
+
+    res = sanitize_config(default_conf_usdt, show_sensitive=True)
+    assert res['exchange']['key'] == default_conf_usdt['exchange']['key']
+    assert res['exchange']['secret'] == default_conf_usdt['exchange']['secret']

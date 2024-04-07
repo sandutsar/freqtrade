@@ -14,7 +14,7 @@ pip install -U -r requirements-plot.txt
 
 The `freqtrade plot-dataframe` subcommand shows an interactive graph with three subplots:
 
-* Main plot with candlestics and indicators following price (sma/ema)
+* Main plot with candlesticks and indicators following price (sma/ema)
 * Volume bars
 * Additional indicators as specified by `--indicators2`
 
@@ -65,7 +65,7 @@ optional arguments:
                         _today.json`
   --timerange TIMERANGE
                         Specify what timerange of data to use.
-  -i TIMEFRAME, --timeframe TIMEFRAME, --ticker-interval TIMEFRAME
+  -i TIMEFRAME, --timeframe TIMEFRAME
                         Specify timeframe (`1m`, `5m`, `30m`, `1h`, `1d`).
   --no-trades           Skip using trades from backtesting file and DB.
 
@@ -96,7 +96,7 @@ Strategy arguments:
 Example:
 
 ``` bash
-freqtrade plot-dataframe -p BTC/ETH
+freqtrade plot-dataframe -p BTC/ETH --strategy AwesomeStrategy
 ```
 
 The `-p/--pairs` argument can be used to specify pairs you would like to plot.
@@ -106,9 +106,6 @@ The `-p/--pairs` argument can be used to specify pairs you would like to plot.
 
 Specify custom indicators.
 Use `--indicators1` for the main plot and `--indicators2` for the subplot below (if values are in a different range than prices).
-
-!!! Tip
-    You will almost certainly want to specify a custom strategy! This can be done by adding `-s Classname` / `--strategy ClassName` to the command.
 
 ``` bash
 freqtrade plot-dataframe --strategy AwesomeStrategy -p BTC/ETH --indicators1 sma ema --indicators2 macd
@@ -273,6 +270,9 @@ def plot_config(self):
 !!! Warning
     `plotly` arguments are only supported with plotly library and will not work with freq-ui.
 
+!!! Note "Trade position adjustments"
+    If `position_adjustment_enable` / `adjust_trade_position()` is used, the trade initial buy price is averaged over multiple orders and the trade start price will most likely appear outside the candle range.
+
 ## Plot profit
 
 ![plot-profit](assets/plot-profit.png)
@@ -283,6 +283,8 @@ The `plot-profit` subcommand shows an interactive graph with three plots:
 * The summarized profit made by backtesting.
 Note that this is not the real-world profit, but more of an estimate.
 * Profit for each individual pair.
+* Parallelism of trades.
+* Underwater (Periods of drawdown).
 
 The first graph is good to get a grip of how the overall market progresses.
 
@@ -291,6 +293,8 @@ Perhaps you want an algorithm that steadily makes small profits, or one that act
 This graph will also highlight the start (and end) of the Max drawdown period.
 
 The third graph can be useful to spot outliers, events in pairs that cause profit spikes.
+
+The forth graph can help you analyze trade parallelism, showing how often max_open_trades have been maxed out.
 
 Possible options for the `freqtrade plot-profit` subcommand:
 
@@ -311,8 +315,8 @@ optional arguments:
                         Specify what timerange of data to use.
   --export EXPORT       Export backtest results, argument are: trades.
                         Example: `--export=trades`
-  --export-filename PATH
-                        Save backtest results to the file with this filename.
+  --export-filename PATH, --backtest-filename PATH
+                        Use backtest results from this filename.
                         Requires `--export` to be set as well. Example:
                         `--export-filename=user_data/backtest_results/backtest
                         _today.json`
@@ -323,7 +327,7 @@ optional arguments:
   --trade-source {DB,file}
                         Specify the source for trades (Can be DB or file
                         (backtest file)) Default: file
-  -i TIMEFRAME, --timeframe TIMEFRAME, --ticker-interval TIMEFRAME
+  -i TIMEFRAME, --timeframe TIMEFRAME
                         Specify timeframe (`1m`, `5m`, `30m`, `1h`, `1d`).
   --auto-open           Automatically open generated plot.
 

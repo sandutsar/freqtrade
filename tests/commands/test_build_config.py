@@ -30,7 +30,7 @@ def test_validate_is_int():
     assert not validate_is_int('-ee')
 
 
-@pytest.mark.parametrize('exchange', ['bittrex', 'binance', 'kraken', 'ftx'])
+@pytest.mark.parametrize('exchange', ['bybit', 'binance', 'kraken'])
 def test_start_new_config(mocker, caplog, exchange):
     wt_mock = mocker.patch.object(Path, "write_text", MagicMock())
     mocker.patch.object(Path, "exists", MagicMock(return_value=True))
@@ -44,6 +44,8 @@ def test_start_new_config(mocker, caplog, exchange):
         'fiat_display_currency': 'EUR',
         'timeframe': '15m',
         'dry_run': True,
+        'trading_mode': 'spot',
+        'margin_mode': '',
         'exchange_name': exchange,
         'exchange_key': 'sampleKey',
         'exchange_secret': 'Samplesecret',

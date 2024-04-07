@@ -1,4 +1,3 @@
-import io
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -12,15 +11,20 @@ import tabulate
 from colorama import Fore, Style
 from pandas import isna, json_normalize
 
-from freqtrade.constants import FTHYPT_FILEVERSION, USERPATH_STRATEGIES
+from freqtrade.constants import FTHYPT_FILEVERSION, Config
+from freqtrade.enums import HyperoptState
 from freqtrade.exceptions import OperationalException
-from freqtrade.misc import deep_merge_dicts, round_coin_value, round_dict, safe_value_fallback2
+from freqtrade.misc import deep_merge_dicts, round_dict, safe_value_fallback2
 from freqtrade.optimize.hyperopt_epoch_filters import hyperopt_filter_epochs
+from freqtrade.optimize.optimize_reports import generate_wins_draws_losses
+from freqtrade.util import fmt_coin
 
 
 logger = logging.getLogger(__name__)
 
 NON_OPT_PARAM_APPENDIX = "  # value loaded from strategy"
+
+HYPER_PARAMS_FILE_FORMAT = rapidjson.NM_NATIVE | rapidjson.NM_NAN
 
 
 def hyperopt_serializer(x):
@@ -32,16 +36,25 @@ def hyperopt_serializer(x):
     return str(x)
 
 
-class HyperoptTools():
+class HyperoptStateContainer:
+    """ Singleton class to track state of hyperopt"""
+    state: HyperoptState = HyperoptState.OPTIMIZE
+
+    @classmethod
+    def set_state(cls, value: HyperoptState):
+        cls.state = value
+
+
+class HyperoptTools:
 
     @staticmethod
-    def get_strategy_filename(config: Dict, strategy_name: str) -> Optional[Path]:
+    def get_strategy_filename(config: Config, strategy_name: str) -> Optional[Path]:
         """
         Get Strategy-location (filename) from strategy_name
         """
         from freqtrade.resolvers.strategy_resolver import StrategyResolver
-        directory = Path(config.get('strategy_path', config['user_data_dir'] / USERPATH_STRATEGIES))
-        strategy_objs = StrategyResolver.search_all_objects(directory, False)
+        strategy_objs = StrategyResolver.search_all_objects(
+            config, False, config.get('recursive_strategy_search', False))
         strategies = [s for s in strategy_objs if s['name'] == strategy_name]
         if strategies:
             strategy = strategies[0]
@@ -66,11 +79,20 @@ class HyperoptTools():
         with filename.open('w') as f:
             rapidjson.dump(final_params, f, indent=2,
                            default=hyperopt_serializer,
-                           number_mode=rapidjson.NM_NATIVE | rapidjson.NM_NAN
+                           number_mode=HYPER_PARAMS_FILE_FORMAT
                            )
 
     @staticmethod
-    def try_export_params(config: Dict[str, Any], strategy_name: str, params: Dict):
+    def load_params(filename: Path) -> Dict:
+        """
+        Load parameters from file
+        """
+        with filename.open('r') as f:
+            params = rapidjson.load(f, number_mode=HYPER_PARAMS_FILE_FORMAT)
+        return params
+
+    @staticmethod
+    def try_export_params(config: Config, strategy_name: str, params: Dict):
         if params.get(FTHYPT_FILEVERSION, 1) >= 2 and not config.get('disableparamexport', False):
             # Export parameters ...
             fn = HyperoptTools.get_strategy_filename(config, strategy_name)
@@ -80,12 +102,12 @@ class HyperoptTools():
                 logger.warning("Strategy not found, not exporting parameter file.")
 
     @staticmethod
-    def has_space(config: Dict[str, Any], space: str) -> bool:
+    def has_space(config: Config, space: str) -> bool:
         """
         Tell if the space value is contained in the configuration
         """
         # 'trailing' and 'protection spaces are not included in the 'default' set of spaces
-        if space in ('trailing', 'protection'):
+        if space in ('trailing', 'protection', 'trades'):
             return any(s in config['spaces'] for s in [space, 'all'])
         else:
             return any(s in config['spaces'] for s in [space, 'all', 'default'])
@@ -120,23 +142,24 @@ class HyperoptTools():
             return False
 
     @staticmethod
-    def load_filtered_results(results_file: Path, config: Dict[str, Any]) -> Tuple[List, int]:
+    def load_filtered_results(results_file: Path, config: Config) -> Tuple[List, int]:
         filteroptions = {
             'only_best': config.get('hyperopt_list_best', False),
             'only_profitable': config.get('hyperopt_list_profitable', False),
             'filter_min_trades': config.get('hyperopt_list_min_trades', 0),
             'filter_max_trades': config.get('hyperopt_list_max_trades', 0),
-            'filter_min_avg_time': config.get('hyperopt_list_min_avg_time', None),
-            'filter_max_avg_time': config.get('hyperopt_list_max_avg_time', None),
-            'filter_min_avg_profit': config.get('hyperopt_list_min_avg_profit', None),
-            'filter_max_avg_profit': config.get('hyperopt_list_max_avg_profit', None),
-            'filter_min_total_profit': config.get('hyperopt_list_min_total_profit', None),
-            'filter_max_total_profit': config.get('hyperopt_list_max_total_profit', None),
-            'filter_min_objective': config.get('hyperopt_list_min_objective', None),
-            'filter_max_objective': config.get('hyperopt_list_max_objective', None),
+            'filter_min_avg_time': config.get('hyperopt_list_min_avg_time'),
+            'filter_max_avg_time': config.get('hyperopt_list_max_avg_time'),
+            'filter_min_avg_profit': config.get('hyperopt_list_min_avg_profit'),
+            'filter_max_avg_profit': config.get('hyperopt_list_max_avg_profit'),
+            'filter_min_total_profit': config.get('hyperopt_list_min_total_profit'),
+            'filter_max_total_profit': config.get('hyperopt_list_max_total_profit'),
+            'filter_min_objective': config.get('hyperopt_list_min_objective'),
+            'filter_max_objective': config.get('hyperopt_list_max_objective'),
         }
         if not HyperoptTools._test_hyperopt_results_exist(results_file):
             # No file found.
+            logger.warning(f"Hyperopt file {results_file} not found.")
             return [], 0
 
         epochs = []
@@ -158,7 +181,7 @@ class HyperoptTools():
 
     @staticmethod
     def show_epoch_details(results, total_epochs: int, print_json: bool,
-                           no_header: bool = False, header_str: str = None) -> None:
+                           no_header: bool = False, header_str: Optional[str] = None) -> None:
         """
         Display details of the hyperopt result
         """
@@ -175,9 +198,10 @@ class HyperoptTools():
 
         if print_json:
             result_dict: Dict = {}
-            for s in ['buy', 'sell', 'protection', 'roi', 'stoploss', 'trailing']:
+            for s in ['buy', 'sell', 'protection',
+                      'roi', 'stoploss', 'trailing', 'max_open_trades']:
                 HyperoptTools._params_update_for_json(result_dict, params, non_optimized, s)
-            print(rapidjson.dumps(result_dict, default=str, number_mode=rapidjson.NM_NATIVE))
+            print(rapidjson.dumps(result_dict, default=str, number_mode=HYPER_PARAMS_FILE_FORMAT))
 
         else:
             HyperoptTools._params_pretty_print(params, 'buy', "Buy hyperspace params:",
@@ -189,6 +213,8 @@ class HyperoptTools():
             HyperoptTools._params_pretty_print(params, 'roi', "ROI table:", non_optimized)
             HyperoptTools._params_pretty_print(params, 'stoploss', "Stoploss:", non_optimized)
             HyperoptTools._params_pretty_print(params, 'trailing', "Trailing stop:", non_optimized)
+            HyperoptTools._params_pretty_print(
+                params, 'max_open_trades', "Max Open Trades:", non_optimized)
 
     @staticmethod
     def _params_update_for_json(result_dict, params, non_optimized, space: str) -> None:
@@ -227,7 +253,9 @@ class HyperoptTools():
             if space == "stoploss":
                 stoploss = safe_value_fallback2(space_params, no_params, space, space)
                 result += (f"stoploss = {stoploss}{appendix}")
-
+            elif space == "max_open_trades":
+                max_open_trades = safe_value_fallback2(space_params, no_params, space, space)
+                result += (f"max_open_trades = {max_open_trades}{appendix}")
             elif space == "roi":
                 result = result[:-1] + f'{appendix}\n'
                 minimal_roi_result = rapidjson.dumps({
@@ -247,7 +275,7 @@ class HyperoptTools():
             print(result)
 
     @staticmethod
-    def _space_params(params, space: str, r: int = None) -> Dict:
+    def _space_params(params, space: str, r: Optional[int] = None) -> Dict:
         d = params.get(space)
         if d:
             # Round floats to `r` digits after the decimal point if requested
@@ -299,8 +327,7 @@ class HyperoptTools():
                 f"Objective: {results['loss']:.5f}")
 
     @staticmethod
-    def prepare_trials_columns(trials: pd.DataFrame, legacy_mode: bool,
-                               has_drawdown: bool) -> pd.DataFrame:
+    def prepare_trials_columns(trials: pd.DataFrame, has_drawdown: bool) -> pd.DataFrame:
         trials['Best'] = ''
 
         if 'results_metrics.winsdrawslosses' not in trials.columns:
@@ -309,38 +336,35 @@ class HyperoptTools():
 
         if not has_drawdown:
             # Ensure compatibility with older versions of hyperopt results
-            trials['results_metrics.max_drawdown_abs'] = None
-            trials['results_metrics.max_drawdown'] = None
+            trials['results_metrics.max_drawdown_account'] = None
+        if 'is_random' not in trials.columns:
+            trials['is_random'] = False
 
-        if not legacy_mode:
-            # New mode, using backtest result for metrics
-            trials['results_metrics.winsdrawslosses'] = trials.apply(
-                lambda x: f"{x['results_metrics.wins']} {x['results_metrics.draws']:>4} "
-                          f"{x['results_metrics.losses']:>4}", axis=1)
-            trials = trials[['Best', 'current_epoch', 'results_metrics.total_trades',
-                             'results_metrics.winsdrawslosses',
-                             'results_metrics.profit_mean', 'results_metrics.profit_total_abs',
-                             'results_metrics.profit_total', 'results_metrics.holding_avg',
-                             'results_metrics.max_drawdown', 'results_metrics.max_drawdown_abs',
-                             'loss', 'is_initial_point', 'is_best']]
+        # New mode, using backtest result for metrics
+        trials['results_metrics.winsdrawslosses'] = trials.apply(
+            lambda x: generate_wins_draws_losses(
+                            x['results_metrics.wins'], x['results_metrics.draws'],
+                            x['results_metrics.losses']
+                      ), axis=1)
 
-        else:
-            # Legacy mode
-            trials = trials[['Best', 'current_epoch', 'results_metrics.trade_count',
-                             'results_metrics.winsdrawslosses', 'results_metrics.avg_profit',
-                             'results_metrics.total_profit', 'results_metrics.profit',
-                             'results_metrics.duration', 'results_metrics.max_drawdown',
-                             'results_metrics.max_drawdown_abs', 'loss', 'is_initial_point',
-                             'is_best']]
+        trials = trials[['Best', 'current_epoch', 'results_metrics.total_trades',
+                         'results_metrics.winsdrawslosses',
+                         'results_metrics.profit_mean', 'results_metrics.profit_total_abs',
+                         'results_metrics.profit_total', 'results_metrics.holding_avg',
+                         'results_metrics.max_drawdown',
+                         'results_metrics.max_drawdown_account', 'results_metrics.max_drawdown_abs',
+                         'loss', 'is_initial_point', 'is_random', 'is_best']]
 
-        trials.columns = ['Best', 'Epoch', 'Trades', ' Win Draw Loss', 'Avg profit',
-                          'Total profit', 'Profit', 'Avg duration', 'Max Drawdown',
-                          'max_drawdown_abs', 'Objective', 'is_initial_point', 'is_best']
+        trials.columns = [
+            'Best', 'Epoch', 'Trades', ' Win  Draw  Loss  Win%', 'Avg profit',
+            'Total profit', 'Profit', 'Avg duration', 'max_drawdown', 'max_drawdown_account',
+            'max_drawdown_abs', 'Objective', 'is_initial_point', 'is_random', 'is_best'
+            ]
 
         return trials
 
     @staticmethod
-    def get_result_table(config: dict, results: list, total_epochs: int, highlight_best: bool,
+    def get_result_table(config: Config, results: list, total_epochs: int, highlight_best: bool,
                          print_colorized: bool, remove_header: int) -> str:
         """
         Log result table
@@ -351,23 +375,24 @@ class HyperoptTools():
         tabulate.PRESERVE_WHITESPACE = True
         trials = json_normalize(results, max_level=1)
 
-        legacy_mode = 'results_metrics.total_trades' not in trials
-        has_drawdown = 'results_metrics.max_drawdown_abs' in trials.columns
+        has_account_drawdown = 'results_metrics.max_drawdown_account' in trials.columns
 
-        trials = HyperoptTools.prepare_trials_columns(trials, legacy_mode, has_drawdown)
+        trials = HyperoptTools.prepare_trials_columns(trials, has_account_drawdown)
 
         trials['is_profit'] = False
-        trials.loc[trials['is_initial_point'], 'Best'] = '*     '
+        trials.loc[trials['is_initial_point'] | trials['is_random'], 'Best'] = '*     '
         trials.loc[trials['is_best'], 'Best'] = 'Best'
-        trials.loc[trials['is_initial_point'] & trials['is_best'], 'Best'] = '* Best'
+        trials.loc[
+            (trials['is_initial_point'] | trials['is_random']) & trials['is_best'],
+            'Best'] = '* Best'
         trials.loc[trials['Total profit'] > 0, 'is_profit'] = True
         trials['Trades'] = trials['Trades'].astype(str)
-        perc_multi = 1 if legacy_mode else 100
+        # perc_multi = 1 if legacy_mode else 100
         trials['Epoch'] = trials['Epoch'].apply(
             lambda x: '{}/{}'.format(str(x).rjust(len(str(total_epochs)), ' '), total_epochs)
         )
         trials['Avg profit'] = trials['Avg profit'].apply(
-            lambda x: f'{x * perc_multi:,.2f}%'.rjust(7, ' ') if not isna(x) else "--".rjust(7, ' ')
+            lambda x: f'{x:,.2%}'.rjust(7, ' ') if not isna(x) else "--".rjust(7, ' ')
         )
         trials['Avg duration'] = trials['Avg duration'].apply(
             lambda x: f'{x:,.1f} m'.rjust(7, ' ') if isinstance(x, float) else f"{x}"
@@ -379,42 +404,45 @@ class HyperoptTools():
 
         stake_currency = config['stake_currency']
 
-        if has_drawdown:
-            trials['Max Drawdown'] = trials.apply(
-                lambda x: '{} {}'.format(
-                    round_coin_value(x['max_drawdown_abs'], stake_currency),
-                    '({:,.2f}%)'.format(x['Max Drawdown'] * perc_multi).rjust(10, ' ')
-                ).rjust(25 + len(stake_currency))
-                if x['Max Drawdown'] != 0.0 else '--'.rjust(25 + len(stake_currency)),
-                axis=1
-            )
-        else:
-            trials = trials.drop(columns=['Max Drawdown'])
+        trials[f"Max Drawdown{' (Acct)' if has_account_drawdown else ''}"] = trials.apply(
+            lambda x: "{} {}".format(
+                fmt_coin(x['max_drawdown_abs'], stake_currency, keep_trailing_zeros=True),
+                (f"({x['max_drawdown_account']:,.2%})"
+                    if has_account_drawdown
+                    else f"({x['max_drawdown']:,.2%})"
+                 ).rjust(10, ' ')
+            ).rjust(25 + len(stake_currency))
+            if x['max_drawdown'] != 0.0 or x['max_drawdown_account'] != 0.0
+            else '--'.rjust(25 + len(stake_currency)),
+            axis=1
+        )
 
-        trials = trials.drop(columns=['max_drawdown_abs'])
+        trials = trials.drop(columns=['max_drawdown_abs', 'max_drawdown', 'max_drawdown_account'])
 
         trials['Profit'] = trials.apply(
             lambda x: '{} {}'.format(
-                round_coin_value(x['Total profit'], stake_currency),
-                '({:,.2f}%)'.format(x['Profit'] * perc_multi).rjust(10, ' ')
-            ).rjust(25+len(stake_currency))
-            if x['Total profit'] != 0.0 else '--'.rjust(25+len(stake_currency)),
+                fmt_coin(x['Total profit'], stake_currency, keep_trailing_zeros=True),
+                f"({x['Profit']:,.2%})".rjust(10, ' ')
+            ).rjust(25 + len(stake_currency))
+            if x['Total profit'] != 0.0 else '--'.rjust(25 + len(stake_currency)),
             axis=1
         )
         trials = trials.drop(columns=['Total profit'])
 
         if print_colorized:
+            trials2 = trials.astype(str)
             for i in range(len(trials)):
                 if trials.loc[i]['is_profit']:
-                    for j in range(len(trials.loc[i])-3):
-                        trials.iat[i, j] = "{}{}{}".format(Fore.GREEN,
-                                                           str(trials.loc[i][j]), Fore.RESET)
+                    for j in range(len(trials.loc[i]) - 3):
+                        trials2.iat[i, j] = f"{Fore.GREEN}{str(trials.iloc[i, j])}{Fore.RESET}"
                 if trials.loc[i]['is_best'] and highlight_best:
-                    for j in range(len(trials.loc[i])-3):
-                        trials.iat[i, j] = "{}{}{}".format(Style.BRIGHT,
-                                                           str(trials.loc[i][j]), Style.RESET_ALL)
-
-        trials = trials.drop(columns=['is_initial_point', 'is_best', 'is_profit'])
+                    for j in range(len(trials.loc[i]) - 3):
+                        trials2.iat[i, j] = (
+                            f"{Style.BRIGHT}{str(trials.iloc[i, j])}{Style.RESET_ALL}"
+                        )
+            trials = trials2
+            del trials2
+        trials = trials.drop(columns=['is_initial_point', 'is_best', 'is_profit', 'is_random'])
         if remove_header > 0:
             table = tabulate.tabulate(
                 trials.to_dict(orient='list'), tablefmt='orgtbl',
@@ -436,7 +464,7 @@ class HyperoptTools():
         return table
 
     @staticmethod
-    def export_csv_file(config: dict, results: list, csv_file: str) -> None:
+    def export_csv_file(config: Config, results: list, csv_file: str) -> None:
         """
         Log result to csv-file
         """
@@ -449,8 +477,8 @@ class HyperoptTools():
             return
 
         try:
-            io.open(csv_file, 'w+').close()
-        except IOError:
+            Path(csv_file).open('w+').close()
+        except OSError:
             logger.error(f"Failed to create CSV file: {csv_file}")
             return
 
@@ -460,17 +488,19 @@ class HyperoptTools():
 
         base_metrics = ['Best', 'current_epoch', 'results_metrics.total_trades',
                         'results_metrics.profit_mean', 'results_metrics.profit_median',
-                        'results_metrics.profit_total',
-                        'Stake currency',
+                        'results_metrics.profit_total', 'Stake currency',
                         'results_metrics.profit_total_abs', 'results_metrics.holding_avg',
+                        'results_metrics.trade_count_long', 'results_metrics.trade_count_short',
                         'loss', 'is_initial_point', 'is_best']
         perc_multi = 100
 
-        param_metrics = [("params_dict."+param) for param in results[0]['params_dict'].keys()]
+        param_metrics = [("params_dict." + param) for param in results[0]['params_dict'].keys()]
         trials = trials[base_metrics + param_metrics]
 
         base_columns = ['Best', 'Epoch', 'Trades', 'Avg profit', 'Median profit', 'Total profit',
-                        'Stake currency', 'Profit', 'Avg duration', 'Objective',
+                        'Stake currency', 'Profit', 'Avg duration',
+                        'Trade count long', 'Trade count short',
+                        'Objective',
                         'is_initial_point', 'is_best']
         param_columns = list(results[0]['params_dict'].keys())
         trials.columns = base_columns + param_columns
